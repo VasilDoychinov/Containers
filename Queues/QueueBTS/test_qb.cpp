@@ -207,8 +207,8 @@ void bq_concurrent_ths()
    QueueBTS_<Test_type>  bq{capacity} ;                                  Log_to(0, ": empty ", bq) ;
 
    constexpr size_t   test_size = 100000 ;                                // Test size (total)
-   constexpr size_t   num_readers = 5 ;                                  // # reading threads
-   constexpr size_t   num_writers = 3 ;                                  // # writing threads
+   constexpr size_t   num_readers = 3 ;                                  // # reading threads
+   constexpr size_t   num_writers = 5 ;                                  // # writing threads
 
    flWait = true ;
    Log_to(0, "\n> Concurrentcy: Tests------------------: queue is: ",

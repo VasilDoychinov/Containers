@@ -26,6 +26,10 @@
 //                             reason: complete the functionality
 //    - wait_to_pop() family: wait on a condition_variable until Queue is !empty
 //
+//    - NB: no time-out option privided. To support that change wait_...() with a parameter that will be
+//          passed onto _wait_...() and further use condition_variable.wait_for() instead of .wait()
+//          Further, on return consider the result.
+//
 
 
 #ifndef QUEUE_BTS_HPP
@@ -72,8 +76,6 @@ class QueueBTS_ {  static_assert(std::is_swappable_v<T>, "> QueueBTS_<> requires
 
     bool            _isOK{false} ;
 
-    mutable std::mutex _mx_all ;
-
   private:
                                   // @return the value of Tail
     _TailPair _get_tail() const& { Lock_guard lu{_mx_tail} ; return {_size, _tail} ; }
@@ -82,34 +84,33 @@ class QueueBTS_ {  static_assert(std::is_swappable_v<T>, "> QueueBTS_<> requires
                                   // the same but for an Index: used with, like, for_each()
     size_t _index_advance(size_t i) const&  { return ++i == _capacity ? 0 : i ; }
 
-/* wait_...
-    std::unique_lock<std::mutex> _wait_for_data() {                      // no time-out
-                 std::unique_lock<std::mutex>  lu{_mx_head} ;            // [&] C++17: this incl.
-                 _cv_empty.wait(lu, [&]()->bool { return 0 != this->size() ; } );
-                 return lu ;
-              }
-
-    std::unique_lock<std::mutex> _wait_for_capacity() {                  // no time-out
-                 std::unique_lock<std::mutex>  lu{_mx_tail} ;            // [&] C++17: this incl.
-                 _cv_full.wait(lu, [&]()->bool { return  _size < _capacity ; } );
-                 return lu ;
-              }**/
-
-    OptHeadLock_ _check_for_data() { UniqueLock_t  lu{_mx_head} ;       // if data: _head + 1 < _tail
-                   auto [ws, wh] = _get_tail() ;                              // [_size,_tail]
+                                  // check_...() and return the result
+    OptHeadLock_ _check_for_data() { UniqueLock_t   lu{_mx_head} ;       // if data: _head + 1 < _tail
+                   auto [ws, wh] = _get_tail() ;                              // [_size,_tail] > 0
                    return ws > 0 ? OptHeadLock_{std::pair{std::move(lu), ws}} // [lock,_size @ _head]
                                  : OptHeadLock_{} ;
-              }
-    OptTailLock_ _check_for_capa() { UniqueLock_t  lu{_mx_tail} ;        // if capacity: invariants: - _size < _capaciry
+                 }
+    OptTailLock_ _check_for_capa() { UniqueLock_t   lu{_mx_tail} ;       // if capacity: invariants: - _size < _capaciry
                    return _size < _capacity ? OptTailLock_{std::move(lu)}
                                             : OptTailLock_{} ;
-                }
+                 }
+                                  // wait_...()
+    OptHeadLock_ _wait_for_data() { UniqueLock_t   lu{_mx_head} ;        // ??? no time-out; [&] C++17: this incl.
+                   size_t wsize ;
+                   _cv_empty.wait(lu, [&]() { auto [ws,wt]= _get_tail() ; return (wsize = ws) > 0 ; });
+                   // _cv_empty.wait(lu, [&]()->bool { return 0 != this->size() ; } );
+                   return OptHeadLock_{std::pair{std::move(lu), wsize}} ;
+                 }
+    OptTailLock_ _wait_for_capa() { UniqueLock_t lu{_mx_tail} ;          // ??? no time-out; [&] C++17: this incl.
+                   _cv_full.wait(lu, [&]() { return  _size < _capacity ; });
+                   return OptTailLock_{std::move(lu)} ;
+                 }
 
     void _pop_protected_head(size_t rs) & { size_t ns = rs - 1 ;         // 'rs': size related to current _head
              _handle_advance(_head) ;
              while(!_size.compare_exchange_strong(rs,ns)) ns = rs - 1 ;  // as _size is not protected: --_size;
          }
-    void _push_protected_tail() & { _handle_advance(_tail), ++_size ; }   //
+    void _push_protected_tail() & { _handle_advance(_tail), ++_size ; }  //
 
 
   public:
@@ -124,7 +125,7 @@ class QueueBTS_ {  static_assert(std::is_swappable_v<T>, "> QueueBTS_<> requires
 
                                   // public APIs: descriptive
     size_t size() const& { std::lock_guard<std::mutex> lt{_mx_tail}; return _size ; }
-    bool empty() const& { std::lock_guard<std::mutex> lt{_mx_tail} ; return _size == 0 ; }
+    bool empty() const&  { return this->size() == 0 ; }
     operator bool () const& { return _isOK ; }                           // if valid: ??? protections
 
                                   // functionality: push/pop
@@ -135,7 +136,7 @@ class QueueBTS_ {  static_assert(std::is_swappable_v<T>, "> QueueBTS_<> requires
     bool push_list(std::vector<T>&& inil) ;                              // pushes until all in: for testing, mostly: might BLOCK
     std::vector<T> pop_list(size_t count) ;                              // pop 'count' elements into Container
 
-    bool wait_and_pop(T& v) & ;                                          // untill data appears [no time-out]
+    bool wait_and_pop(T& v) & ;                                          // untill data appears: @return - always true or, BLOCK
     T    wait_and_pop() & { T v{}; this->wait_and_pop(v) ; return v ; }  // ...
     bool wait_to_push(T value) & ;                                       // @return - if successful
 
@@ -162,58 +163,53 @@ template <typename T> QueueBTS_<T>
 template <typename T> bool QueueBTS_<T>
 ::try_push(T value) &                                                    // to 'tail'
 {
-   // std::lock_guard<std::mutex> lg{_mx_all} ;
-
    {  // T is requested as swappable -> move new element into *_tail
       decltype(auto)   result = this->_check_for_capa() ;                // protection on _tail: active
       if (!result)     return false ;                                    // empty Queue
 
-      *_tail = (value), _push_protected_tail() ;                // into the dummy node::_data
-      // Log_to(0, ": PUSHED: ", value) ;
+      *_tail = std::move(value), _push_protected_tail() ;
    }  // eo Lock: it's been released
 
-   _cv_empty.notify_all() ;                                              // for not empty anymore
+   _cv_empty.notify_one() ;                                              // for not empty anymore
    return true ;
 }
 
-/* wait_to_push()
-template<typename T> inline bool QueueBTS_<T>                           // wait until vacancy, then push
-::wait_to_push(T value) &                                               // @return - value: memory allocated somewhere else
+/* wait_to_push() */
+template<typename T> inline bool QueueBTS_<T>                            // wait until vacancy, then push
+::wait_to_push(T value) &                                                // @return - alway true or, BLOCK
 {
-   static size_t  current_value = 0 ;
-
-   {  // lock block, wait for data
-      std::unique_lock<std::mutex>   lu{_wait_for_capacity()} ;         // lock's still on
-      // and, there is vacancy
-      if (value != current_value++)  Log_to(0, "> pushing ", value, " at current ", current_value - 1) ;
+   {  // lock block, wait for vacancy
+      decltype(auto)   result = this->_wait_for_capa() ;                 // lock's still on
+      // if (!result)     return false ;                                 here: waited for vacancy (& NO time-out)
       *_tail = std::move(value), _push_protected_tail() ;
    } // eo Lock
 
    this->_cv_empty.notify_one() ;
-   return true ;                                                        // bool is or eventual Time-out
+   return true ;
 }
-*/
+
 
 #include <thread>
+static inline std::thread::id get_tid() { return std::this_thread::get_id() ; }
 
 template <typename T> bool QueueBTS_<T>
 ::push_list(std::vector<T>&& inil)                                       // ??? Time-out
 {
-   size_t   count_yields = 0 ;
-
+   // used with try_push(): size_t   count_yields = 0 ;
    std::vector<T>  work = std::move(inil) ;
-                                                                         // Log_to(0, "\n> push_list() of ", work.size(), " elements") ;
+                                                                         Log_to(0, "\n> push_list() of ", work.size(), " elements") ;
    // for (auto& el : work) {
-   size_t   sw = work.size() ; T value{} ;
+   size_t   sw = work.size() ;                                           // for Testing with try_push(): T value{} ;
    for (size_t i = 0 ; i < sw ; )  {
-      // this->wait_to_push(std::move(el)) ;                                // might BLOCK
-      if (try_push(work[i])) { value = work[i++] ; }
-      else { std::this_thread::yield() ; // if (--count == 0)   break ;
+      this->wait_to_push(std::move(work[i++])) ;                         // replace the block below: might BLOCK
+      /* if (try_push(work[i])) { value = work[i++] ; }
+      else { std::this_thread::yield() ;
          ++count_yields ;
-      }
+      } uses try_push() instead of wait_to_push() */
    }
 
-   Log_to(0,"\n> from #", std::this_thread::get_id(), " last value PUSHED: ", value, ", #yields: ", count_yields) ;
+   // Log_to(0,"> from #", std::this_thread::get_id(), " last value PUSHED: ", value, ", #yields: ", count_yields) ;
+   Log_to(0,"> from #", get_tid(), ": end of push_list() for: ", work[0]) ;
    return true ;
 }
 
@@ -221,57 +217,48 @@ template <typename T> bool QueueBTS_<T>
 template<typename T> inline bool QueueBTS_<T>                            // pop from 'head'
 ::try_pop(T& value) &                                                    // @return - the result
 {
-   // std::lock_guard<std::mutex> lg{_mx_all} ;
-
    {  // protected (by *result for _head) section(initiated in _check_for_data()
-      decltype(auto)   result = this->_check_for_data() ;                // protection on _head: active
+      decltype(auto)   result = this->_check_for_data() ;                // auto[lock,_size]
       if (!result)     return false ;                                    // empty Queue
 
       value = std::move(*_head), _pop_protected_head(result->second) ;   // _head + 1 = _tail
-      // Log_to(0, ": POPPED value: ", value) ;
    } // eo Lock
 
-   // this->_cv_full.notify_one() ;
+   this->_cv_full.notify_one() ;
    return true ;
 }
 
-/* wait_and_pop()
+// wait_and_pop(): NO time-out
 template<typename T> inline bool QueueBTS_<T>                            // wait until data appears, then pop
-::wait_and_pop(T& value) &                                               // @return - value: memory allocated somewhere else
+::wait_and_pop(T& value) &                                               // @return - always true or, BLOCK
 {
-   static size_t  current_value = 0 ;
-
    {  // lock block, wait for data
-      std::unique_lock<std::mutex>   lu{_wait_for_data()} ;              // lock's still on
-      // and, there is data ready
-      value = std::move(*_head) ;
-      if (value != current_value++)  {
-         Log_to(0, "> poping ", value, " at current ", current_value - 1,
-                   " :: head at ", _head - _cont.begin(), " size: ", _size) ;
-      }
-      _pop_protected_head() ;
+      decltype(auto)   result = this->_wait_for_data() ;                 // auto [lock,_size]
+      // if (!result)     return false ;                                 here: waited for vacancy (& NO time-out)
+      value = std::move(*_head), _pop_protected_head(result->second) ;
    } // eo Lock
 
    this->_cv_full.notify_one() ;
    return true ;                                                         // bool is or eventual Time-out
 }
-*/
 
 template <typename T> std::vector<T> QueueBTS_<T>                        // pop 'count' elements into Container
 ::pop_list(size_t count)
 {
-   T value{} ;
-   size_t   count_yields = 0 ;
-   std::vector<T>   work{} ; work.resize(count, T{}) ;                       //
+   /* used with try_pop(): size_t   count_yields = 0 ;
+   ** T value{} ; */
+   std::vector<T>   work{} ; work.resize(count, T{}) ;                   //
+
    for (size_t i = 0 ; i < count ; )    {
-      // wait_and_pop(value), work.emplace_back(std::move(value)) ;
-      if (try_pop(value))   { work[i++] = std::move(value) ; }
+      wait_and_pop(work[i++]) ;   // , work.emplace_back(std::move(value)) ;
+      /* if (try_pop(value))   { work[i++] = std::move(value) ; }
       else { std::this_thread::yield() ;
          ++count_yields ;
-      }
+      } */
    }
 
-   Log_to(0,"\n> from #", std::this_thread::get_id(), " last value POPPED: ", value, ", #yields: ", count_yields) ;
+   // Log_to(0,"> from #", std::this_thread::get_id(), " last value POPPED: ", value, ", #yields: ", count_yields) ;
+   Log_to(0,"> from #", get_tid(), ": end of pop_list(): ", count > 0 ? work[count - 1] : T{}) ;
    return work ;
 }
 

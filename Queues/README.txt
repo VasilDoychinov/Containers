@@ -42,8 +42,11 @@
 //    - wait_to_push(): waits for vacancy
 //    - wait_and_pop(): waiting to pop an element.
 //                             reason: complete the functionality
+//      NB: no time-out option but could be easily installed - see queue_bts.hpp
 //    - push_list(): pushes a collection of value (at space availability) - might block
 //    - pop_list(); pop the desired number of values (if present) - might block
+//      push/pop_list() based on wait_...(); an example for try_...() shown.          
+//       
 
 
 
